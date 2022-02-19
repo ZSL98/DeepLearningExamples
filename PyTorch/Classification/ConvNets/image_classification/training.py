@@ -27,13 +27,17 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+import os
+import wandb
 import time
 from copy import deepcopy
 from functools import wraps
 from typing import Callable, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from torch.cuda.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -41,6 +45,94 @@ from . import logger as log
 from . import utils
 from .logger import TrainingMetrics, ValidationMetrics
 from .models.common import EMA
+
+def binary_accuracy(logit, y, apply_sigmoid=True, reduce=True) -> float:
+    prob = logit.sigmoid() if apply_sigmoid else logit
+    pred = prob.round().long().view(-1)
+    return (pred == y).float().mean() if reduce else (pred == y).float()
+
+
+def multiclass_accuracy(scores, y, reduce=True):
+    _, pred = scores.max(dim=1)
+    return (pred == y).float().mean() if reduce else (pred == y).float()
+
+
+def multiclass_accuracies(scores, y, tops: Tuple[int]):
+    _, pred = scores.topk(k=max(tops), dim=1)
+    labelled = (y != -100)
+    if not any(labelled):
+        return [1.0 for i in tops]
+    hit = (pred[labelled] == y[labelled, None])
+    topk_acc = hit.float().cumsum(dim=1).mean(dim=0)
+    return [topk_acc[i-1] for i in tops]
+
+class _Loss:
+    def __call__(self, *args):
+        raise NotImplementedError
+
+    def metrics(self, *args):
+        "Returns list. First element is used for comparison (higher = better)"
+        raise NotImplementedError
+
+    def trn_metrics(self):
+        "Metrics from last call."
+        raise NotImplementedError
+
+    metric_names = []
+
+    
+class _MultiExitAccuracy(_Loss):
+    def __init__(self, n_exits, acc_tops=(1,), _binary_clf=False):
+        self.n_exits = n_exits
+        self._binary_clf = _binary_clf
+        self._acc_tops = acc_tops
+        self._cache = dict()
+        self.metric_names = [f'acc{i}_avg' for i in acc_tops]
+        for i in acc_tops:
+            self.metric_names += [f'acc{i}_clf{k}' for k in range(n_exits)]
+            self.metric_names += [f'acc{i}_ens{k}' for k in range(1, n_exits)]
+        self.metric_names += ['avg_maxprob']
+
+    def __call__(self, *args):
+        raise NotImplementedError
+
+    def _metrics(self, logits_list, y):
+        ensemble = torch.zeros_like(logits_list[0])
+        acc_clf = np.zeros((self.n_exits, len(self._acc_tops)))
+        acc_ens = np.zeros((self.n_exits, len(self._acc_tops)))
+        
+        for i, logits in enumerate(logits_list):
+            if self._binary_clf:
+                ensemble = ensemble*i/(i+1) + F.sigmoid(logits)/(i+1)
+                acc_clf[i] = binary_accuracy(logits, y)
+                acc_ens[i] = binary_accuracy(ensemble, y, apply_sigmoid=False)
+            else:
+                ensemble += F.softmax(logits, dim=1)
+                acc_clf[i] = multiclass_accuracies(logits, y, self._acc_tops)
+                acc_ens[i] = multiclass_accuracies(ensemble, y, self._acc_tops)
+                
+        maxprob = F.softmax(logits_list[-1].data, dim=1).max(dim=1)[0].mean()
+
+        out = list(acc_clf.mean(axis=0))
+        for i in range(acc_clf.shape[1]):
+            out += list(acc_clf[:, i])
+            out += list(acc_ens[1:, i])
+        return out + [maxprob]
+
+    def metrics(self, X, y, *args):
+        logits_list = X
+        return self._metrics(logits_list, y)
+
+    def trn_metrics(self):
+        return self._metrics(self._cache['logits_list'], self._cache['y'])
+    
+    
+class ClassificationOnlyLoss(_MultiExitAccuracy):
+    def __call__(self, X, y, *args):
+        self._cache['logits_list'] = X
+        self._cache['y'] = y
+        return sum(F.cross_entropy(logits, y)
+                   for logits in self._cache['logits_list'])/len(X)
 
 
 class Executor:
@@ -67,7 +159,9 @@ class Executor:
         if ts_script:
             self.model = torch.jit.script(self.model)
         self.ts_script = ts_script
-        self.loss = xform(loss) if loss is not None else None
+        # TODO: help!
+        self.loss = ClassificationOnlyLoss(len(self.model.exit_list))
+        # self.loss = xform(loss) if loss is not None else None
         self.amp = amp
         self.scaler = scaler
         self.is_distributed = False
@@ -125,13 +219,13 @@ class Executor:
 
     def train(self):
         self.model.train()
-        if self.loss is not None:
-            self.loss.train()
+        # if self.loss is not None:
+        #     self.loss.train()
 
     def eval(self):
         self.model.eval()
-        if self.loss is not None:
-            self.loss.eval()
+        # if self.loss is not None:
+        #     self.loss.eval()
 
 
 class Trainer:
@@ -252,14 +346,14 @@ def train(
     return interrupted
 
 
-def validate(infer_fn, val_loader, log_fn, prof=-1, with_loss=True):
-    top1 = log.AverageMeter()
+def validate(infer_fn, val_loader, exit_list, exit_idx, log_fn, prof=-1, with_loss=True):
     # switch to evaluate mode
-
     end = time.time()
+    last_exit_res = [0, 0]
 
     data_iter = enumerate(val_loader)
-
+    top1 = log.AverageMeter()
+    top5 = log.AverageMeter()
     for i, (input, target) in data_iter:
         bs = input.size(0)
         data_time = time.time() - end
@@ -270,7 +364,7 @@ def validate(infer_fn, val_loader, log_fn, prof=-1, with_loss=True):
             output = infer_fn(input)
 
         with torch.no_grad():
-            prec1, prec5 = utils.accuracy(output.data, target, topk=(1, 5))
+            prec1, prec5 = utils.accuracy(output[exit_idx], target, topk=(1, 5))
 
             if torch.distributed.is_initialized():
                 if with_loss:
@@ -296,6 +390,7 @@ def validate(infer_fn, val_loader, log_fn, prof=-1, with_loss=True):
         it_time = time.time() - end
 
         top1.record(prec1, bs)
+        top5.record(prec5, bs)
 
         log_fn(
             compute_ips=utils.calc_ips(bs, it_time - data_time),
@@ -309,6 +404,13 @@ def validate(infer_fn, val_loader, log_fn, prof=-1, with_loss=True):
         if (prof > 0) and (i + 1 >= prof):
             time.sleep(5)
             break
+        
+        # print(top1.get_val()[0])
+        # print(top1.get_val()[1])
+    wandb.log({'pred1_e{}'.format(exit_list[exit_idx]):top1.get_val()[0]})
+    wandb.log({'pred5_e{}'.format(exit_list[exit_idx]):top5.get_val()[0]})
+        # last_exit_res[0] = top1.get_val()[0]
+        # last_exit_res[1] = top1.get_val()[1]
 
     return top1.get_val()
 
@@ -320,6 +422,7 @@ def train_loop(
     train_loader,
     train_loader_len,
     val_loader,
+    exit_list,
     logger,
     should_backup_checkpoint,
     best_prec1=0,
@@ -352,6 +455,7 @@ def train_loop(
     print(f"RUNNING EPOCHS FROM {start_epoch} TO {end_epoch}")
     with utils.TimeoutHandler() as timeout_handler:
         interrupted = False
+        metric_record = []
         for epoch in range(start_epoch, end_epoch):
             if logger is not None:
                 logger.start_epoch()
@@ -376,24 +480,30 @@ def train_loop(
 
             if not skip_validation:
                 trainer.eval()
-                for k, infer_fn in trainer.validation_steps().items():
-                    if logger is not None:
-                        data_iter = logger.iteration_generator_wrapper(
-                            val_loader, mode="val"
+                prec1 = 0
+                for exit_idx in range(len(exit_list)):
+                    for k, infer_fn in trainer.validation_steps().items():
+                        if logger is not None:
+                            data_iter = logger.iteration_generator_wrapper(
+                                val_loader, mode="val"
+                            )
+                        else:
+                            data_iter = val_loader
+
+                    
+                        step_prec1, _ = validate(
+                            infer_fn,
+                            data_iter,
+                            exit_list,
+                            exit_idx,
+                            val_metrics[k].log,
+                            prof=prof,
                         )
-                    else:
-                        data_iter = val_loader
 
-                    step_prec1, _ = validate(
-                        infer_fn,
-                        data_iter,
-                        val_metrics[k].log,
-                        prof=prof,
-                    )
+                        if k == "val":
+                            prec1 = step_prec1
 
-                    if k == "val":
-                        prec1 = step_prec1
-
+                metric_record.append(prec1)
                 if prec1 > best_prec1:
                     is_best = True
                     best_prec1 = prec1
@@ -428,6 +538,10 @@ def train_loop(
                     backup_filename=backup_filename,
                     filename=checkpoint_filename,
                 )
+
+            # diff = [metric_record[i+1]-metric_record[i] for i in range(len(metric_record)-1)]
+            # if len([i for i in diff[-3:] if i < 0.2]) == 3:
+            #     break
 
             if early_stopping_patience > 0:
                 if not is_best:

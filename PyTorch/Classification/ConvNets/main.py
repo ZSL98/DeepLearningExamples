@@ -28,6 +28,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import os
+import wandb
+import torchvision.models as models
+from collections import OrderedDict
 
 os.environ["KMP_AFFINITY"] = "disabled" # We need to do this before importing anything else as a workaround for this bug: https://github.com/pytorch/pytorch/issues/28389
 
@@ -58,6 +61,7 @@ from image_classification.models import (
     efficientnet_widese_b0,
     efficientnet_widese_b4,
 )
+from image_classification.models.networks import partial_resnet, ResNetwthMultiExit
 from image_classification.optimizers import (
     get_optimizer,
     lr_cosine_policy,
@@ -156,7 +160,7 @@ def add_parser_arguments(parser, skip_arch=False):
     parser.add_argument(
         "-b",
         "--batch-size",
-        default=256,
+        default=128,
         type=int,
         metavar="N",
         help="mini-batch size (default: 256) per gpu",
@@ -173,7 +177,7 @@ def add_parser_arguments(parser, skip_arch=False):
     parser.add_argument(
         "--lr",
         "--learning-rate",
-        default=0.1,
+        default=0.01,
         type=float,
         metavar="LR",
         help="initial learning rate",
@@ -354,8 +358,13 @@ def add_parser_arguments(parser, skip_arch=False):
         choices=[am.name for am in AffinityMode],
     )
 
+    parser.add_argument(
+        "--split_point",
+        type=int,
+    )
 
-def prepare_for_training(args, model_args, model_arch):
+
+def prepare_for_training(args, model_args, model):
     args.distributed = False
     if "WORLD_SIZE" in os.environ:
         args.distributed = int(os.environ["WORLD_SIZE"]) > 1
@@ -363,7 +372,7 @@ def prepare_for_training(args, model_args, model_arch):
     else:
         args.local_rank = 0
 
-    args.gpu = 0
+    args.gpu = 1
     args.world_size = 1
 
     if args.distributed:
@@ -457,20 +466,22 @@ def prepare_for_training(args, model_args, model_arch):
     memory_format = (
         torch.channels_last if args.memory_format == "nhwc" else torch.contiguous_format
     )
-    model = model_arch(
-        **{
-            k: v
-            if k != "pretrained"
-            else v and (not args.distributed or dist.get_rank() == 0)
-            for k, v in model_args.__dict__.items()
-        }
-    )
+    # model = model_arch(
+    #     **{
+    #         k: v
+    #         if k != "pretrained"
+    #         else v and (not args.distributed or dist.get_rank() == 0)
+    #         for k, v in model_args.__dict__.items()
+    #     }
+    # )
 
-    image_size = (
-        args.image_size
-        if args.image_size is not None
-        else model.arch.default_image_size
-    )
+    image_size = 224
+
+    # image_size = (
+    #     args.image_size
+    #     if args.image_size is not None
+    #     else model.arch.default_image_size
+    # )
 
     scaler = torch.cuda.amp.GradScaler(
         init_scale=args.static_loss_scale,
@@ -512,7 +523,7 @@ def prepare_for_training(args, model_args, model_arch):
         args.data,
         image_size,
         args.batch_size,
-        model_args.num_classes,
+        1000,
         args.mixup > 0.0,
         interpolation=args.interpolation,
         augmentation=args.augmentation,
@@ -529,7 +540,7 @@ def prepare_for_training(args, model_args, model_arch):
         args.data,
         image_size,
         args.batch_size,
-        model_args.num_classes,
+        1000,
         False,
         interpolation=args.interpolation,
         workers=args.workers,
@@ -557,10 +568,10 @@ def prepare_for_training(args, model_args, model_arch):
         logger = log.Logger(args.print_freq, [], start_epoch=start_epoch - 1)
 
     logger.log_parameter(args.__dict__, verbosity=dllogger.Verbosity.DEFAULT)
-    logger.log_parameter(
-        {f"model.{k}": v for k, v in model_args.__dict__.items()},
-        verbosity=dllogger.Verbosity.DEFAULT,
-    )
+    # logger.log_parameter(
+    #     {f"model.{k}": v for k, v in model_args.__dict__.items()},
+    #     verbosity=dllogger.Verbosity.DEFAULT,
+    # )
 
     optimizer = get_optimizer(
         list(executor.model.named_parameters()),
@@ -610,6 +621,56 @@ def main(args, model_args, model_arch):
     global best_prec1
     best_prec1 = 0
 
+    wandb.init(
+        # Set entity to specify your username or team name
+        # ex: entity="carey",
+        # Set the project where this run will be logged
+        project="resnet_train", 
+        name="split_point:"+str(args.split_point),
+        # Track hyperparameters and run metadata
+        config={
+        "architecture": "resnet101",
+        "dataset": "imagenet",})
+
+    # model = partial_resnet(start_point=args.split_point, end_point=args.split_point, simple_exit=False)
+    # model_pretrained = models.resnet101(pretrained=True)
+
+    # dict_trained = model_pretrained.state_dict().copy()
+    # dict_new = OrderedDict()
+
+    # for k,v in model.state_dict().items():
+    #     if 'num_batches_tracked' not in k:
+    #         if 'pre' in k:
+    #             dict_new[k] = dict_trained[k[4:]]
+    #         elif 'exit' in k:
+    #             if len(model.exit) == 1:
+    #                 dict_new[k] = dict_trained['layer4.0.'+k[7:]]
+    #             elif len(model.exit) == 2:
+    #                 if 'exit.0' in k:
+    #                     dict_new[k] = dict_trained['layer3.0.'+k[7:]]
+    #                 elif 'exit.1' in k:
+    #                     dict_new[k] = dict_trained['layer4.0.'+k[7:]]
+    #             elif len(model.exit) == 3:
+    #                 if 'exit.0' in k:
+    #                     dict_new[k] = dict_trained['layer2.0.'+k[7:]]
+    #                 elif 'exit.1' in k:
+    #                     dict_new[k] = dict_trained['layer3.0.'+k[7:]]
+    #                 elif 'exit.2' in k:
+    #                     dict_new[k] = dict_trained['layer4.0.'+k[7:]]
+    #         else:
+    #             dict_new[k] = dict_trained[k]
+
+    # for k,v in model.named_parameters():
+    #     if 'exit' not in k and 'fc' not in k:
+    #         v.requires_grad=False
+    #     else:
+    #         v.requires_grad=True
+    
+    # model.load_state_dict(dict_new)
+
+    exit_list =[1,4,7,10,13,16,19,22,25,28,31,33]
+    model = ResNetwthMultiExit(exit_list=exit_list)
+
     (
         trainer,
         lr_policy,
@@ -618,7 +679,13 @@ def main(args, model_args, model_arch):
         val_loader,
         logger,
         start_epoch,
-    ) = prepare_for_training(args, model_args, model_arch)
+    ) = prepare_for_training(args, model_args, model)
+
+
+    # save_dir = './checkpoints/train_metric_controlled/split_point_{}/'.format(args.split_point)
+    save_dir = './checkpoints/finetune'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
     train_loop(
         trainer,
@@ -626,6 +693,7 @@ def main(args, model_args, model_arch):
         train_loader,
         train_loader_len,
         val_loader,
+        exit_list,
         logger,
         should_backup_checkpoint(args),
         start_epoch=start_epoch,
@@ -638,7 +706,7 @@ def main(args, model_args, model_arch):
         skip_training=args.evaluate,
         skip_validation=args.training_only,
         save_checkpoints=args.save_checkpoints and not args.evaluate,
-        checkpoint_dir=args.workspace,
+        checkpoint_dir=save_dir,
         checkpoint_filename=args.checkpoint_filename,
     )
     exp_duration = time.time() - exp_start_time
